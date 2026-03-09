@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import io
 import re
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from deep_translator import GoogleTranslator
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFoundfrom deep_translator import GoogleTranslator
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
