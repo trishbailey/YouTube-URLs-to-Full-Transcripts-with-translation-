@@ -1,5 +1,5 @@
-streamlit
-youtube-transcript-api==0.6.2
-deep-translator
-openpyxl
-pandas
+streamlit>=1.40,<2
+pandas>=2.2,<3
+openpyxl>=3.1.5,<4
+deep-translator>=1.11.4,<2
+youtube-transcript-api>=1.2.4,<2
