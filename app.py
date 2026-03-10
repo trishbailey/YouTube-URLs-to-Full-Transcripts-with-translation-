@@ -1,41 +1,31 @@
-import streamlit as st
-import pandas as pd
 import io
 import re
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
 from deep_translator import GoogleTranslator
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    YouTubeRequestFailed,
+)
 
-# ── Page config ────────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="YouTube Transcript Extractor",
     page_icon="🎬",
     layout="wide",
 )
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
-
-def extract_video_id(url: str) -> str | None:
-    """Extract YouTube video ID from various URL formats."""
-    patterns = [
-        r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&?\/]|$)",
-        r"youtu\.be\/([0-9A-Za-z_-]{11})",
-        r"embed\/([0-9A-Za-z_-]{11})",
-        r"shorts\/([0-9A-Za-z_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
 
 LANG_CODE_MAP = {
     "None (keep original)": None,
-    # Major national languages
     "Burmese (Myanmar) → English": "my",
     "Filipino / Tagalog → English": "tl",
     "Indonesian → English": "id",
@@ -44,111 +34,181 @@ LANG_CODE_MAP = {
     "Malay → English": "ms",
     "Thai → English": "th",
     "Vietnamese → English": "vi",
-    # South Asian languages with SEA presence
     "Bengali → English": "bn",
-    # Regional / additional languages with YouTube presence
     "Cebuano → English": "ceb",
     "Javanese → English": "jw",
     "Sundanese → English": "su",
     "Tetum (Timor-Leste) → English": "tet",
 }
 
-
-def fetch_transcript(video_id: str, source_lang_code: str | None) -> dict:
-    """
-    Fetch transcript for a video.
-    Returns a dict with keys: video_id, title_url, transcript, language, translated, error
-    """
-    result = {
-        "video_id": video_id,
-        "url": f"https://www.youtube.com/watch?v={video_id}",
-        "transcript": "",
-        "language_detected": "",
-        "translated": False,
-        "error": "",
-    }
-
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-        # Prefer manually created over auto-generated; prefer source lang if specified
-        transcript_obj = None
-        if source_lang_code:
-            try:
-                transcript_obj = transcript_list.find_transcript([source_lang_code])
-            except Exception:
-                pass
-        if transcript_obj is None:
-            try:
-                transcript_obj = transcript_list.find_manually_created_transcript(
-                    [source_lang_code] if source_lang_code else []
-                )
-            except Exception:
-                pass
-        if transcript_obj is None:
-            transcript_obj = transcript_list.find_generated_transcript(
-                [source_lang_code] if source_lang_code else ["en", "id", "ms"]
-            )
-
-        result["language_detected"] = transcript_obj.language_code
-        raw = transcript_obj.fetch()
-        full_text = " ".join(segment["text"] for segment in raw)
-
-        # Translate if requested
-        if source_lang_code and transcript_obj.language_code == source_lang_code:
-            translator = GoogleTranslator(source=source_lang_code, target="en")
-            # GoogleTranslator has a char limit; chunk if necessary
-            chunks = _chunk_text(full_text, 4500)
-            translated_chunks = [translator.translate(c) for c in chunks]
-            result["transcript"] = " ".join(translated_chunks)
-            result["translated"] = True
-        else:
-            result["transcript"] = full_text
-
-    except TranscriptsDisabled:
-        result["error"] = "Transcripts are disabled for this video."
-    except NoTranscriptFound:
-        result["error"] = "No transcript found for the selected language."
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
+FALLBACK_LANGS = ["en", "id", "ms", "th", "vi", "tl"]
+MAX_TRANSLATION_CHARS = 4500
 
 
-def _chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks of max_chars without breaking words."""
+def extract_video_id(value: str) -> Optional[str]:
+    """Extract an 11-character YouTube video ID from a URL or raw ID."""
+    if not value:
+        return None
+
+    value = value.strip()
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
+        return value
+
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&?\/]|$)",
+        r"youtu\.be\/([0-9A-Za-z_-]{11})(?:[?&\/]|$)",
+        r"embed\/([0-9A-Za-z_-]{11})(?:[?&\/]|$)",
+        r"shorts\/([0-9A-Za-z_-]{11})(?:[?&\/]|$)",
+        r"live\/([0-9A-Za-z_-]{11})(?:[?&\/]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            return match.group(1)
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_transcript_client() -> YouTubeTranscriptApi:
+    return YouTubeTranscriptApi()
+
+
+def chunk_text(text: str, max_chars: int = MAX_TRANSLATION_CHARS) -> list[str]:
+    """Split text into chunks without breaking words where possible."""
+    if len(text) <= max_chars:
+        return [text]
+
     words = text.split()
-    chunks, current = [], []
-    length = 0
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
     for word in words:
-        if length + len(word) + 1 > max_chars:
+        proposed_len = current_len + len(word) + (1 if current else 0)
+        if proposed_len > max_chars and current:
             chunks.append(" ".join(current))
-            current, length = [word], len(word)
+            current = [word]
+            current_len = len(word)
         else:
             current.append(word)
-            length += len(word) + 1
+            current_len = proposed_len
+
     if current:
         chunks.append(" ".join(current))
     return chunks
 
 
+def translate_to_english(text: str, source_lang_code: str) -> str:
+    translator = GoogleTranslator(source=source_lang_code, target="en")
+    translated_chunks = []
+    for chunk in chunk_text(text):
+        translated_chunks.append(translator.translate(chunk) or "")
+    return " ".join(part.strip() for part in translated_chunks if part).strip()
+
+
+def transcript_to_text(fetched_transcript) -> str:
+    return " ".join(snippet.text.strip() for snippet in fetched_transcript if getattr(snippet, "text", "")).strip()
+
+
+def choose_transcript(transcript_list, requested_lang: Optional[str]):
+    """Select the best transcript available.
+
+    Order:
+    1. Exact requested language, manual or generated.
+    2. Preferred fallback languages.
+    3. First manual transcript.
+    4. First generated transcript.
+    """
+    all_tracks = list(transcript_list)
+    if not all_tracks:
+        raise NoTranscriptFound("No transcript tracks available")
+
+    if requested_lang:
+        try:
+            return transcript_list.find_transcript([requested_lang])
+        except Exception:
+            pass
+
+    preferred = [lang for lang in FALLBACK_LANGS if lang != requested_lang]
+    if preferred:
+        try:
+            return transcript_list.find_transcript(preferred)
+        except Exception:
+            pass
+
+    manual_tracks = [t for t in all_tracks if not getattr(t, "is_generated", False)]
+    if manual_tracks:
+        return manual_tracks[0]
+
+    return all_tracks[0]
+
+
+def fetch_transcript(video_id: str, source_lang_code: Optional[str]) -> dict:
+    result = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "language_detected": "",
+        "language_label": "",
+        "translated": False,
+        "track_type": "",
+        "transcript": "",
+        "error": "",
+    }
+
+    try:
+        client = get_transcript_client()
+        transcript_list = client.list(video_id)
+        transcript_obj = choose_transcript(transcript_list, source_lang_code)
+
+        result["language_detected"] = transcript_obj.language_code
+        result["language_label"] = getattr(transcript_obj, "language", "")
+        result["track_type"] = "Auto-generated" if getattr(transcript_obj, "is_generated", False) else "Manual"
+
+        fetched = transcript_obj.fetch()
+        original_text = transcript_to_text(fetched)
+
+        if not original_text:
+            result["error"] = "Transcript track was found, but no text was returned."
+            return result
+
+        if source_lang_code and transcript_obj.language_code == source_lang_code:
+            translated_text = translate_to_english(original_text, source_lang_code)
+            if translated_text:
+                result["transcript"] = translated_text
+                result["translated"] = True
+            else:
+                result["transcript"] = original_text
+        else:
+            result["transcript"] = original_text
+
+    except TranscriptsDisabled:
+        result["error"] = "Transcripts are disabled for this video."
+    except NoTranscriptFound:
+        result["error"] = "No transcript could be found for this video."
+    except VideoUnavailable:
+        result["error"] = "Video is unavailable, private, removed, or region-restricted."
+    except YouTubeRequestFailed as exc:
+        result["error"] = f"YouTube request failed: {exc}"
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
 def build_excel(rows: list[dict]) -> bytes:
-    """Build a formatted Excel workbook and return as bytes."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Transcripts"
 
-    # ── Styles ──
     header_fill = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
     header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    alt_fill = PatternFill("solid", start_color="D6E4F0", end_color="D6E4F0")
+    alt_fill = PatternFill("solid", start_color="DCE6F1", end_color="DCE6F1")
     white_fill = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
 
     cell_font = Font(name="Arial", size=10)
     cell_align = Alignment(vertical="top", wrap_text=True)
-
     thin_border = Border(
         left=Side(style="thin", color="BFBFBF"),
         right=Side(style="thin", color="BFBFBF"),
@@ -156,32 +216,42 @@ def build_excel(rows: list[dict]) -> bytes:
         bottom=Side(style="thin", color="BFBFBF"),
     )
 
-    # ── Headers ──
-    headers = ["#", "YouTube URL", "Video ID", "Language Detected", "Translated to EN?", "Status", "Transcript"]
-    col_widths = [5, 45, 15, 18, 16, 22, 100]
+    headers = [
+        "#",
+        "YouTube URL",
+        "Video ID",
+        "Language Code",
+        "Language",
+        "Track Type",
+        "Translated to EN?",
+        "Status",
+        "Transcript / Error",
+    ]
+    col_widths = [5, 46, 16, 16, 22, 16, 16, 14, 110]
 
-    for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
+    for idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
+        cell = ws.cell(row=1, column=idx, value=header)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_align
         cell.border = thin_border
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+        ws.column_dimensions[get_column_letter(idx)].width = width
 
-    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
-    # ── Data rows ──
     for row_num, row in enumerate(rows, start=2):
         fill = alt_fill if row_num % 2 == 0 else white_fill
         status = "Error" if row["error"] else "Success"
-        transcript_or_error = row["error"] if row["error"] else row["transcript"]
-
+        transcript_or_error = row["error"] or row["transcript"]
         values = [
             row_num - 1,
             row["url"],
             row["video_id"],
             row["language_detected"],
+            row["language_label"],
+            row["track_type"],
             "Yes" if row["translated"] else "No",
             status,
             transcript_or_error,
@@ -194,182 +264,197 @@ def build_excel(rows: list[dict]) -> bytes:
             cell.alignment = cell_align
             cell.border = thin_border
 
-        # Row height — transcript cells can be tall; cap at 400pts
-        ws.row_dimensions[row_num].height = min(400, max(20, len(str(transcript_or_error)) // 15))
+        approx_height = max(20, min(400, len(str(transcript_or_error)) // 12))
+        ws.row_dimensions[row_num].height = approx_height
 
-    # ── Auto-filter ──
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-# ── UI ───────────────────────────────────────────────────────────────────────────
+def normalize_uploaded_urls(df: pd.DataFrame) -> list[str]:
+    cols_lower = [str(c).strip().lower() for c in df.columns]
+
+    if "id" in cols_lower and "url" not in cols_lower:
+        id_col = df.columns[cols_lower.index("id")]
+        return [
+            f"https://www.youtube.com/watch?v={video_id}"
+            for video_id in df[id_col].dropna().astype(str).str.strip()
+            if extract_video_id(video_id)
+        ]
+
+    for candidate in ["url", "youtube_url", "video_url", "link"]:
+        if candidate in cols_lower:
+            source_col = df.columns[cols_lower.index(candidate)]
+            return df[source_col].dropna().astype(str).str.strip().tolist()
+
+    raise ValueError("No supported column found. Use one of: id, url, youtube_url, video_url, link")
+
+
+def dedupe_preserve_order(urls: list[str]) -> list[str]:
+    seen = set()
+    clean_urls = []
+    for url in urls:
+        url = url.strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        clean_urls.append(url)
+    return clean_urls
+
 
 st.title("🎬 YouTube Transcript Extractor")
-st.caption("Paste YouTube URLs → download a formatted Excel file with full transcripts.")
+st.caption("Paste YouTube URLs or upload a file, then export a formatted Excel workbook.")
 
 with st.sidebar:
-    st.header("⚙️ Options")
+    st.header("Options")
     translation_option = st.selectbox(
         "Translate to English from…",
         options=list(LANG_CODE_MAP.keys()),
-        help="Select a Southeast Asian source language to translate transcripts into English.",
+        help="Choose a source language only if you want English output for transcripts in that language.",
     )
     st.markdown("---")
     st.markdown(
-        "**Supported URL formats**\n"
-        "- `https://www.youtube.com/watch?v=...`\n"
-        "- `https://youtu.be/...`\n"
-        "- `https://www.youtube.com/shorts/...`\n"
-        "- `https://www.youtube.com/embed/...`"
+        "**Accepted input**\n"
+        "- Full YouTube URLs\n"
+        "- youtu.be URLs\n"
+        "- shorts URLs\n"
+        "- bare 11-character video IDs\n"
+        "- CSV/XLSX with `url` or `id` column"
     )
     st.markdown("---")
     st.markdown(
-        "**Notes**\n"
-        "- Transcripts must be enabled on the video.\n"
-        "- Translation covers all major SEA languages via Google Translate (free tier).\n"
-        "- Very long videos may take a moment to process."
+        "**Operational notes**\n"
+        "- Videos must have captions available.\n"
+        "- Some videos fail if YouTube blocks the request or the video is private.\n"
+        "- Translation uses Google Translate via `deep-translator`."
     )
 
-st.subheader("📋 Enter YouTube URLs")
+st.subheader("Input")
+tab_paste, tab_file = st.tabs(["Paste URLs", "Upload CSV / Excel"])
 
-tab_paste, tab_csv = st.tabs(["✏️ Paste URLs", "📂 Upload CSV"])
-
-raw_urls = []
+raw_urls: list[str] = []
 
 with tab_paste:
     url_input = st.text_area(
-        label="One URL per line",
-        placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ\nhttps://youtu.be/abc123xyz",
-        height=200,
+        "One URL or video ID per line",
+        placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ\ndQw4w9WgXcQ",
+        height=220,
     )
     if url_input.strip():
-        raw_urls = [u.strip() for u in url_input.strip().splitlines() if u.strip()]
+        raw_urls = [line.strip() for line in url_input.splitlines() if line.strip()]
 
-with tab_csv:
-    st.markdown(
-        "Upload a **Filmot CSV or Excel export**, or any file with a `url` / `URL` column. "
-        "Filmot exports are automatically detected and the YouTube URL is reconstructed from the `id` column."
-    )
-    uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx", "xls"])
-    if uploaded_file:
+with tab_file:
+    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+    if uploaded_file is not None:
         try:
-            fname = uploaded_file.name.lower()
-            if fname.endswith((".xlsx", ".xls")):
+            file_name = uploaded_file.name.lower()
+            if file_name.endswith((".xlsx", ".xls")):
                 df_upload = pd.read_excel(uploaded_file)
             else:
                 df_upload = pd.read_csv(uploaded_file)
 
-            cols_lower = [c.strip().lower() for c in df_upload.columns]
+            raw_urls = normalize_uploaded_urls(df_upload)
+            st.success(f"Loaded {len(raw_urls)} rows from {uploaded_file.name}.")
+            with st.expander("Preview input rows"):
+                st.dataframe(pd.DataFrame({"input": raw_urls[:25]}), use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not read file: {exc}")
 
-            # Filmot format: has an 'id' column containing bare video IDs
-            if "id" in cols_lower and "url" not in cols_lower:
-                id_col = df_upload.columns[cols_lower.index("id")]
-                raw_urls = [
-                    f"https://www.youtube.com/watch?v={vid}"
-                    for vid in df_upload[id_col].dropna().astype(str).str.strip()
-                    if vid
-                ]
-                st.success(
-                    f"Detected **Filmot format** — reconstructed **{len(raw_urls)} YouTube URLs** "
-                    f"from the `{id_col}` column."
-                )
-            # Generic format: look for a url column
-            else:
-                url_col_idx = next(
-                    (i for i, c in enumerate(cols_lower) if c == "url"), 0
-                )
-                url_col = df_upload.columns[url_col_idx]
-                raw_urls = df_upload[url_col].dropna().astype(str).str.strip().tolist()
-                st.success(f"Loaded **{len(raw_urls)} URLs** from column `{url_col}`.")
+raw_urls = dedupe_preserve_order(raw_urls)
 
-            with st.expander("Preview reconstructed URLs"):
-                st.dataframe(
-                    pd.DataFrame({"YouTube URL": raw_urls[:20]}),
-                    use_container_width=True,
-                )
-        except Exception as e:
-            st.error(f"Could not read file: {e}")
+if raw_urls:
+    st.info(f"Ready to process {len(raw_urls)} unique input rows.")
 
 run = st.button(
-    f"🚀 Extract Transcripts{f' ({len(raw_urls)} URLs)' if raw_urls else ''}",
+    f"Extract transcripts{f' ({len(raw_urls)})' if raw_urls else ''}",
     type="primary",
     use_container_width=True,
     disabled=not raw_urls,
 )
 
 if run:
-    if not raw_urls:
-        st.warning("Please enter at least one YouTube URL.")
-        st.stop()
+    requested_lang = LANG_CODE_MAP[translation_option]
+    results: list[dict] = []
 
-    source_lang_code = LANG_CODE_MAP[translation_option]
-    results = []
-
-    progress = st.progress(0, text="Starting…")
+    progress = st.progress(0, text="Starting extraction…")
     status_box = st.empty()
 
-    for i, url in enumerate(raw_urls):
-        status_box.info(f"Processing ({i+1}/{len(raw_urls)}): `{url}`")
-        video_id = extract_video_id(url)
+    for idx, raw_value in enumerate(raw_urls, start=1):
+        status_box.info(f"Processing {idx}/{len(raw_urls)}: {raw_value}")
+        video_id = extract_video_id(raw_value)
+
         if not video_id:
-            results.append({
-                "video_id": "INVALID",
-                "url": url,
-                "transcript": "",
-                "language_detected": "",
-                "translated": False,
-                "error": "Could not parse a valid YouTube video ID from this URL.",
-            })
+            results.append(
+                {
+                    "video_id": "INVALID",
+                    "url": raw_value,
+                    "language_detected": "",
+                    "language_label": "",
+                    "track_type": "",
+                    "translated": False,
+                    "transcript": "",
+                    "error": "Could not parse a valid YouTube video ID from this input.",
+                }
+            )
         else:
-            results.append(fetch_transcript(video_id, source_lang_code))
-        progress.progress((i + 1) / len(raw_urls), text=f"{i+1}/{len(raw_urls)} processed")
+            results.append(fetch_transcript(video_id, requested_lang))
 
-    status_box.empty()
+        progress.progress(idx / len(raw_urls), text=f"Processed {idx} of {len(raw_urls)}")
+
     progress.empty()
+    status_box.empty()
 
-    # Persist to session state so the download button survives reruns
     st.session_state["results"] = results
     st.session_state["excel_bytes"] = build_excel(results)
 
-# ── Results panel (shown whenever session_state has data) ──
 if "results" in st.session_state:
     results = st.session_state["results"]
-
-    # ── Summary ──
-    successes = sum(1 for r in results if not r["error"])
+    successes = sum(1 for row in results if not row["error"])
     failures = len(results) - successes
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total URLs", len(results))
-    col2.metric("✅ Succeeded", successes)
-    col3.metric("❌ Failed", failures)
+    a, b, c = st.columns(3)
+    a.metric("Total inputs", len(results))
+    b.metric("Succeeded", successes)
+    c.metric("Failed", failures)
 
     if failures:
-        with st.expander("⚠️ Failed URLs"):
-            for r in results:
-                if r["error"]:
-                    st.error(f"**{r['url']}** — {r['error']}")
+        with st.expander("Failures"):
+            for row in results:
+                if row["error"]:
+                    st.error(f"{row['url']} — {row['error']}")
 
-    # ── Preview ──
-    with st.expander("👀 Preview transcripts"):
-        for r in results:
-            if not r["error"]:
-                label = f"🎬 {r['url']} | lang: `{r['language_detected']}`" + (
-                    " | translated ✓" if r["translated"] else ""
-                )
-                with st.expander(label):
-                    st.write(r["transcript"][:3000] + ("…" if len(r["transcript"]) > 3000 else ""))
+    preview_rows = []
+    for row in results:
+        preview_rows.append(
+            {
+                "url": row["url"],
+                "video_id": row["video_id"],
+                "language": row["language_detected"],
+                "track_type": row["track_type"],
+                "translated": row["translated"],
+                "status": "Error" if row["error"] else "Success",
+            }
+        )
 
-    # ── Download — persists across reruns ──
+    st.subheader("Run summary")
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+
+    with st.expander("Transcript preview"):
+        for row in results:
+            if row["error"]:
+                continue
+            label = f"{row['url']} | {row['language_detected']} | {row['track_type']}"
+            with st.expander(label):
+                text = row["transcript"]
+                st.write(text[:4000] + ("…" if len(text) > 4000 else ""))
+
     st.download_button(
-        label="📥 Download Excel",
+        label="Download Excel",
         data=st.session_state["excel_bytes"],
         file_name="youtube_transcripts.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
         type="primary",
+        use_container_width=True,
     )
